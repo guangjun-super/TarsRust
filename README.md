@@ -23,6 +23,9 @@ TarsRust is the Rust implementation of the TARS RPC framework, providing the sam
 
 ## Installation
 
+See the [Tars platform integration guide](docs/platform-integration.md) for platform deployment,
+release packaging, and restart support using the TarsGo native process conventions.
+
 Add the following to your `Cargo.toml`:
 
 ```toml

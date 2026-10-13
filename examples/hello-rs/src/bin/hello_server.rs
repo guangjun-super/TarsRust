@@ -18,14 +18,25 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:10987".to_string());
-    let obj = "Test.HelloServer.HelloObj";
-
-    let app = Application::new();
-    app.add_servant(obj, HelloServant::new(HelloImpl), &addr)?;
-    println!("hello-server: {} listening at tcp://{}", obj, addr);
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let app = if args.first().is_some_and(|arg| arg.starts_with('-')) {
+        let app = Application::from_args(&args)?;
+        let config = app.server_config();
+        let obj = format!("{}.{}.HelloObj", config.app, config.server);
+        app.add_servant_from_config(&obj, HelloServant::new(HelloImpl))?;
+        println!("hello-server: {} using platform configuration", obj);
+        app
+    } else {
+        let addr = args
+            .first()
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:10987");
+        let obj = "Test.HelloServer.HelloObj";
+        let app = Application::new();
+        app.add_servant(obj, HelloServant::new(HelloImpl), addr)?;
+        println!("hello-server: {} listening at tcp://{}", obj, addr);
+        app
+    };
 
     app.run().await?;
     Ok(())

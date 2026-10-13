@@ -3,8 +3,10 @@
 //! Common utilities used across the framework.
 
 mod config;
+mod platform_config;
 
 pub use config::*;
+pub use platform_config::TarsConfig;
 
 use std::sync::atomic::{AtomicI32, Ordering};
 

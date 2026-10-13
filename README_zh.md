@@ -23,6 +23,8 @@ TarsRust 是 TARS RPC 框架的 Rust 实现，提供与 [TarsCpp](https://github
 
 ## 安装
 
+平台部署、发布包结构和重启方式见 [Tars 服务治理平台接入指南](docs/platform-integration.md)。
+
 在 `Cargo.toml` 中添加以下依赖：
 
 ```toml

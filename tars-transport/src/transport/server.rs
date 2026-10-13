@@ -1,18 +1,20 @@
 //! Tars server transport implementation
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
-use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use parking_lot::Mutex;
-use tracing::{debug, error, info, warn};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info, warn};
 
+use super::{ServerProtocolHandler, TarsServerConfig};
 use tars_core::codec::PackageStatus;
 use tars_core::{Context, Result, TarsError};
-use super::{TarsServerConfig, ServerProtocolHandler};
 
 /// Tars server for handling incoming connections
 pub struct TarsServer {
@@ -22,6 +24,7 @@ pub struct TarsServer {
     protocol: Arc<dyn ServerProtocolHandler>,
     /// Close flag
     closed: AtomicBool,
+    shutdown_tx: watch::Sender<bool>,
     /// Number of active connections
     num_conn: AtomicI32,
     /// Number of active invokes
@@ -33,10 +36,12 @@ pub struct TarsServer {
 impl TarsServer {
     /// Create a new TarsServer
     pub fn new(protocol: Arc<dyn ServerProtocolHandler>, config: TarsServerConfig) -> Arc<Self> {
+        let (shutdown_tx, _) = watch::channel(false);
         Arc::new(Self {
             config,
             protocol,
             closed: AtomicBool::new(false),
+            shutdown_tx,
             num_conn: AtomicI32::new(0),
             num_invoke: AtomicI32::new(0),
             last_invoke: Mutex::new(Instant::now()),
@@ -45,11 +50,23 @@ impl TarsServer {
 
     /// Start listening and serving
     pub async fn serve(self: Arc<Self>) -> Result<()> {
-        let listener = TcpListener::bind(&self.config.address).await?;
+        let listener = self.bind().await?;
+        self.serve_with_listener(listener).await
+    }
 
+    /// Bind before starting application tasks, so startup failures can be returned.
+    pub async fn bind(&self) -> Result<TcpListener> {
+        Ok(TcpListener::bind(&self.config.address).await?)
+    }
+
+    /// Serve a previously bound listener.
+    pub async fn serve_with_listener(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         // Create TLS acceptor if SSL is enabled
         let tls_acceptor = if self.config.is_ssl() {
-            let tls_config = self.config.tls_config.as_ref()
+            let tls_config = self
+                .config
+                .tls_config
+                .as_ref()
                 .ok_or_else(|| TarsError::Config("TLS config not set for SSL server".into()))?;
             info!("Server listening on {} (TLS enabled)", self.config.address);
             Some(TlsAcceptor::from(tls_config.clone()))
@@ -58,21 +75,43 @@ impl TarsServer {
             None
         };
 
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut connections = JoinSet::new();
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 break;
             }
 
-            match tokio::time::timeout(self.config.accept_timeout, listener.accept()).await {
+            let accepted = tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed { warn!("Connection task failed: {error}"); }
+                    continue;
+                },
+                accepted = tokio::time::timeout(self.config.accept_timeout, listener.accept()) => accepted,
+            };
+            match accepted {
                 Ok(Ok((stream, addr))) => {
                     self.num_conn.fetch_add(1, Ordering::SeqCst);
                     let server = Arc::clone(&self);
                     let tls_acceptor = tls_acceptor.clone();
 
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let result = if let Some(acceptor) = tls_acceptor {
                             // TLS connection
-                            match acceptor.accept(stream).await {
+                            let handshake = tokio::select! {
+                                _ = async {
+                                    let mut shutdown = server.shutdown_tx.subscribe();
+                                    if !*shutdown.borrow() { let _ = shutdown.changed().await; }
+                                } => Err(TarsError::ConnectionClosed),
+                                result = tokio::time::timeout(server.config.read_timeout, acceptor.accept(stream)) => {
+                                    match result {
+                                        Ok(result) => result.map_err(TarsError::from),
+                                        Err(_) => Err(TarsError::Timeout(server.config.read_timeout.as_millis() as u64)),
+                                    }
+                                },
+                            };
+                            match handshake {
                                 Ok(tls_stream) => {
                                     debug!("TLS connection established from {}", addr);
                                     let (read_half, write_half) = tokio::io::split(tls_stream);
@@ -80,7 +119,7 @@ impl TarsServer {
                                 }
                                 Err(e) => {
                                     warn!("TLS handshake failed from {}: {}", addr, e);
-                                    Err(TarsError::Config(format!("TLS handshake failed: {}", e)))
+                                    Err(e)
                                 }
                             }
                         } else {
@@ -103,7 +142,17 @@ impl TarsServer {
                 }
             }
         }
-
+        drop(listener);
+        // Idle reads are cancelled immediately; dispatched calls finish and send their replies.
+        if tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        }
         Ok(())
     }
 
@@ -115,7 +164,8 @@ impl TarsServer {
         stream.set_nodelay(self.config.tcp_no_delay)?;
 
         let (read_half, write_half) = stream.into_split();
-        self.handle_connection_generic(read_half, write_half, addr).await
+        self.handle_connection_generic(read_half, write_half, addr)
+            .await
     }
 
     /// Handle connection with generic read/write halves (works for both TCP and TLS)
@@ -131,6 +181,7 @@ impl TarsServer {
     {
         let mut buffer = vec![0u8; self.config.tcp_read_buffer];
         let mut accumulated = Vec::new();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             if self.closed.load(Ordering::SeqCst) {
@@ -140,7 +191,11 @@ impl TarsServer {
                 break;
             }
 
-            match tokio::time::timeout(self.config.read_timeout, read_half.read(&mut buffer)).await {
+            let read = tokio::select! {
+                _ = shutdown_rx.changed() => continue,
+                read = tokio::time::timeout(self.config.read_timeout, read_half.read(&mut buffer)) => read,
+            };
+            match read {
                 Ok(Ok(0)) => {
                     debug!("Connection closed by {}", addr);
                     break;
@@ -153,10 +208,16 @@ impl TarsServer {
                         let (pkg_len, status) = self.protocol.parse_package(&accumulated);
                         match status {
                             PackageStatus::Full => {
+                                if self.closed.load(Ordering::SeqCst) {
+                                    break;
+                                }
                                 let pkg: Vec<u8> = accumulated.drain(..pkg_len).collect();
 
                                 // Check concurrent limit
-                                if self.num_invoke.load(Ordering::SeqCst) >= self.config.max_invoke {
+                                if self.config.max_invoke > 0
+                                    && self.num_invoke.load(Ordering::SeqCst)
+                                        >= self.config.max_invoke
+                                {
                                     warn!("Max invoke limit reached");
                                     continue;
                                 }
@@ -184,14 +245,17 @@ impl TarsServer {
 
                                 // Send response
                                 if !response.is_empty() {
-                                    if let Err(e) = tokio::time::timeout(
+                                    match tokio::time::timeout(
                                         self.config.write_timeout,
                                         write_half.write_all(&response),
                                     )
                                     .await
                                     {
-                                        error!("Write error: {:?}", e);
-                                        break;
+                                        Ok(Ok(())) => {}
+                                        result => {
+                                            error!("Write error: {:?}", result);
+                                            return Err(TarsError::ConnectionClosed);
+                                        }
                                     }
                                 }
                             }
@@ -243,6 +307,7 @@ impl TarsServer {
     pub async fn shutdown(&self) {
         info!("Shutting down server...");
         self.closed.store(true, Ordering::SeqCst);
+        self.shutdown_tx.send_replace(true);
 
         // Wait for pending invokes to complete
         let timeout = std::time::Duration::from_secs(30);
@@ -289,7 +354,7 @@ mod tests {
         }
 
         fn get_close_msg(&self) -> Vec<u8> {
-            vec![]
+            vec![0, 0, 0, 4]
         }
 
         fn do_close(&self, _ctx: &Context) {}
@@ -304,5 +369,29 @@ mod tests {
         assert!(!server.is_closed());
         assert_eq!(server.connection_count(), 0);
         assert_eq!(server.invoke_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_protocol_close_message_before_eof() {
+        let server = TarsServer::new(Arc::new(MockHandler), TarsServerConfig::tcp("127.0.0.1:0"));
+        let listener = server.bind().await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let runner = server.clone();
+        let run = tokio::spawn(runner.serve_with_listener(listener));
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(&[0, 0, 0, 4]).await.unwrap();
+        let mut response = [0; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        server.shutdown().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.read_exact(&mut response),
+        )
+        .await
+        .unwrap()
+        .expect("protocol close message was skipped");
+        assert_eq!(response, [0, 0, 0, 4]);
+        assert_eq!(stream.read(&mut response).await.unwrap(), 0);
+        run.await.unwrap().unwrap();
     }
 }

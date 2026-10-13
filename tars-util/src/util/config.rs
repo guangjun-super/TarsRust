@@ -33,6 +33,9 @@ pub struct ServerConfig {
     pub enable_set: bool,
     /// SET division (e.g., "sz.app.1")
     pub set_division: String,
+    /// Interval between tarsnode heartbeats (ms).
+    #[serde(default = "default_main_loop_interval")]
+    pub main_loop_interval: u64,
     /// Accept timeout (ms)
     #[serde(default = "default_accept_timeout")]
     pub accept_timeout: u64,
@@ -69,6 +72,7 @@ pub struct ServerConfig {
 }
 
 fn default_accept_timeout() -> u64 { 10000 }
+fn default_main_loop_interval() -> u64 { 10000 }
 fn default_read_timeout() -> u64 { 60000 }
 fn default_write_timeout() -> u64 { 60000 }
 fn default_handle_timeout() -> u64 { 60000 }
@@ -95,6 +99,7 @@ impl Default for ServerConfig {
             notify: String::new(),
             enable_set: false,
             set_division: String::new(),
+            main_loop_interval: default_main_loop_interval(),
             accept_timeout: default_accept_timeout(),
             read_timeout: default_read_timeout(),
             write_timeout: default_write_timeout(),
