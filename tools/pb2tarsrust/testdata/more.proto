@@ -1,0 +1,18 @@
+syntax = "proto3";
+package example.v1;
+import "hello.proto";
+import "google/protobuf/timestamp.proto";
+message Supplemental {
+  HelloRequest request = 1;
+  google.protobuf.Timestamp time = 2;
+  map<int32, State> states = 3;
+  map<bool, bytes> blobs = 4;
+  repeated bytes data = 5;
+  repeated HelloRequest requests = 6;
+  uint32 unsigned = 7;
+  int64 signed = 8;
+  sint32 zigzag = 9;
+  sfixed32 signed_fixed = 10;
+  fixed64 fixed = 11;
+  map<string, State> type = 12;
+}

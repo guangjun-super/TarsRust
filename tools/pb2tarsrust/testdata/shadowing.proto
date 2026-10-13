@@ -1,0 +1,10 @@
+syntax = "proto3";
+package shadow;
+message String {}
+message Vec {}
+message Send {}
+message Sync {}
+message Ok {}
+message Err {}
+service Shadows { rpc Call(String) returns (Vec); }
+service T { rpc Call(String) returns (Vec); }

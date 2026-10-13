@@ -1,0 +1,12 @@
+[package]
+name = "pb2tarsrust-integration"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tars = { path = "@TARS_PATH@" }
+prost = "0.14"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,12 @@
+syntax = "proto2";
+package legacy;
+enum Mode { FIRST = 5; SECOND = 7; }
+message Legacy {
+  required int32 id = 1;
+  optional string name = 2 [default = "hello\nworld"];
+  optional int32 count = 3 [default = 42];
+  optional Mode mode = 4 [default = SECOND];
+  repeated uint32 values = 5 [packed = true];
+  optional bytes payload = 6 [default = "a\001"];
+  optional double ratio = 7 [default = inf];
+}

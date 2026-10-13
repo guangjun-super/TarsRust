@@ -1,0 +1,34 @@
+syntax = "proto3";
+package example.v1;
+import "common.proto";
+
+enum State {
+  option allow_alias = true;
+  STATE_UNKNOWN = 0;
+  STATE_OK = 1;
+  STATE_GOOD = 1;
+}
+message HelloRequest {
+  string name = 1;
+  optional int32 count = 2;
+  common.Detail detail = 3;
+  map<string, common.Detail> details = 4;
+  oneof choice { string text = 5; HelloRequest child = 6; }
+  repeated sint64 numbers = 7 [packed = false];
+  State state = 8;
+  bytes type = 9;
+  message Nested { uint64 id = 1; }
+  Nested nested = 10;
+  HelloRequest next = 11;
+  repeated State states = 12;
+  double ratio = 13;
+  float score = 14;
+  fixed32 fixed = 15;
+  sfixed64 signed_fixed = 16;
+  bool active = 17;
+}
+message HelloReply { string message = 1; }
+message SamePackage { HelloRequest request = 1; }
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+}
