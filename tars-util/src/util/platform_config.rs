@@ -123,9 +123,11 @@ impl TarsConfig {
         let mut client = ClientConfig::default();
         if let Some(values) = domains.get("tars/application/client") {
             strings!(client, values, locator => "locator", stat => "stat", property => "property");
+            client.endpoint_cache_path = values.get("endpoint-cache-path").cloned();
             numbers!(client, values,
                 async_invoke_timeout => "async-invoke-timeout",
                 refresh_endpoint_interval => "refresh-endpoint-interval",
+                check_status_interval => "check-status-interval",
                 report_interval => "report-interval", sample_rate => "sample-rate",
                 max_sample_count => "max-sample-count", dial_timeout => "clientdialtimeout",
                 idle_timeout => "clientidletimeout", read_timeout => "clientreadtimeout",

@@ -2,9 +2,9 @@
 //!
 //! This module defines endpoint structures and endpoint management.
 
+use crate::protocol::TransportProtocol;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use crate::protocol::TransportProtocol;
 
 /// Weight type for load balancing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -206,7 +206,12 @@ impl ServantInstance {
 
     /// Get full object name
     pub fn object_name(&self) -> String {
-        format!("{}.{}.{}", self.app, self.server, self.servant)
+        let prefix = format!("{}.{}.", self.app, self.server);
+        if self.servant.starts_with(&prefix) {
+            self.servant.clone()
+        } else {
+            format!("{prefix}{}", self.servant)
+        }
     }
 }
 
@@ -366,7 +371,9 @@ mod tests {
         assert_eq!(eps[0].host, "127.0.0.1");
         assert_eq!(eps[0].port, 10000);
 
-        let (name, eps) = parse_obj_name("Test.HelloServer.HelloObj@tcp -h 127.0.0.1 -p 10000:tcp -h 127.0.0.1 -p 10001");
+        let (name, eps) = parse_obj_name(
+            "Test.HelloServer.HelloObj@tcp -h 127.0.0.1 -p 10000:tcp -h 127.0.0.1 -p 10001",
+        );
         assert_eq!(name, "Test.HelloServer.HelloObj");
         assert_eq!(eps.len(), 2);
     }

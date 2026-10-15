@@ -10,23 +10,27 @@
 //! - Automatic recovery after a configurable interval
 
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
-use std::collections::HashMap;
-use tokio::sync::RwLock;
 use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use tars_core::codec::{Buffer, Reader};
 use tars_core::{Result, TarsError};
 use tars_protocol::endpoint::ServantInstance;
 use tars_protocol::protocol::queryf::{
-    EndpointF, decode_endpoint_list,
-    QUERY_FIND_OBJECT_BY_ID_4_ALL, QUERY_FIND_OBJECT_BY_ID_IN_SAME_SET
+    decode_endpoint_list, EndpointF, QUERY_FIND_OBJECT_BY_ID_IN_SAME_GROUP,
+    QUERY_FIND_OBJECT_BY_ID_IN_SAME_SET,
 };
 use tars_protocol::protocol::RequestPacket;
 use tars_protocol::Endpoint;
-use tars_transport::transport::AsyncSimpleTarsClient;
+use tars_protocol::ResponsePacket;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 /// Circuit breaker state for a single registry node
 #[derive(Debug)]
@@ -71,7 +75,10 @@ impl NodeCircuitBreaker {
 
         // Try to recover after REGISTRY_RECOVER_INTERVAL seconds
         if now - open_time >= REGISTRY_RECOVER_INTERVAL {
-            debug!("Node {} entering half-open state for recovery attempt", self.address);
+            debug!(
+                "Node {} entering half-open state for recovery attempt",
+                self.address
+            );
             return true;
         }
 
@@ -97,7 +104,10 @@ impl NodeCircuitBreaker {
             let was_available = self.available.swap(false, Ordering::SeqCst);
             if was_available {
                 self.circuit_open_time.store(now_secs(), Ordering::SeqCst);
-                warn!("Node {} circuit opened after {} consecutive failures", self.address, count);
+                warn!(
+                    "Node {} circuit opened after {} consecutive failures",
+                    self.address, count
+                );
                 return true;
             }
         }
@@ -187,7 +197,7 @@ fn now_secs() -> i64 {
 
 /// Registry circuit breaker constants
 /// Number of consecutive failures before opening circuit
-const REGISTRY_FAIL_THRESHOLD: i32 = 1;  // Open immediately on first failure
+const REGISTRY_FAIL_THRESHOLD: i32 = 1; // Open immediately on first failure
 /// Interval to try recovery (seconds)
 const REGISTRY_RECOVER_INTERVAL: i64 = 30;
 
@@ -205,7 +215,11 @@ pub trait Registrar: Send + Sync {
     async fn query_servant(&self, id: &str) -> Result<(Vec<Endpoint>, Vec<Endpoint>)>;
 
     /// Query servant endpoints by object ID and SET division
-    async fn query_servant_by_set(&self, id: &str, set: &str) -> Result<(Vec<Endpoint>, Vec<Endpoint>)>;
+    async fn query_servant_by_set(
+        &self,
+        id: &str,
+        set: &str,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)>;
 }
 
 /// Direct registrar implementation (no service discovery)
@@ -235,7 +249,11 @@ impl Registrar for DirectRegistrar {
         Ok((self.endpoints.clone(), vec![]))
     }
 
-    async fn query_servant_by_set(&self, _id: &str, _set: &str) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
+    async fn query_servant_by_set(
+        &self,
+        _id: &str,
+        _set: &str,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
         Ok((self.endpoints.clone(), vec![]))
     }
 }
@@ -261,7 +279,11 @@ pub struct TarsRegistry {
 impl TarsRegistry {
     pub fn new(locator: &str) -> Self {
         let nodes = Self::parse_all_nodes(locator);
-        info!("TarsRegistry initialized with {} nodes: {:?}", nodes.len(), nodes);
+        info!(
+            "TarsRegistry initialized with {} nodes: {:?}",
+            nodes.len(),
+            nodes
+        );
 
         Self {
             locator: locator.to_string(),
@@ -394,45 +416,6 @@ impl TarsRegistry {
         Some(format!("{}:{}", host, port))
     }
 
-    /// Select an available node using round-robin with circuit breaker
-    fn select_node(&self) -> Option<String> {
-        let available = self.circuit_breaker.filter_available(&self.nodes);
-
-        if available.is_empty() {
-            warn!("No available registry nodes! All {} nodes are in circuit-open state", self.nodes.len());
-            // If all nodes are unavailable, try to use any node (for recovery attempt)
-            if !self.nodes.is_empty() {
-                let idx = self.current_index.fetch_add(1, Ordering::SeqCst) % self.nodes.len();
-                return Some(self.nodes[idx].clone());
-            }
-            return None;
-        }
-
-        // Round-robin selection among available nodes
-        let idx = self.current_index.fetch_add(1, Ordering::SeqCst) % available.len();
-        Some(available[idx].clone())
-    }
-
-    /// Connect to a specific node
-    async fn connect_to_node(&self, addr: &str) -> Result<AsyncSimpleTarsClient> {
-        let timeout_duration = std::time::Duration::from_millis(self.timeout as u64);
-
-        match tokio::time::timeout(timeout_duration, AsyncSimpleTarsClient::connect(addr)).await {
-            Ok(Ok(client)) => {
-                debug!("Connected to registry node: {}", addr);
-                Ok(client)
-            }
-            Ok(Err(e)) => {
-                error!("Failed to connect to registry node {}: {}", addr, e);
-                Err(e)
-            }
-            Err(_) => {
-                error!("Connection timeout to registry node: {}", addr);
-                Err(TarsError::Timeout(self.timeout as u64))
-            }
-        }
-    }
-
     /// Convert EndpointF to Endpoint
     fn convert_endpoint(epf: &EndpointF) -> Endpoint {
         let mut ep = if epf.istcp == 1 {
@@ -446,11 +429,21 @@ impl TarsRegistry {
         ep.timeout = epf.timeout as u64;
         ep.weight = epf.weight as u32;
         ep.set_id = epf.set_id.clone();
+        ep.grid = epf.grid;
+        ep.qos = epf.qos;
+        ep.weight_type = epf.weight_type as i16;
+        ep.auth_type = epf.auth_type;
         ep
     }
 
     /// Execute query on a specific node with circuit breaker
-    async fn query_on_node(&self, addr: &str, id: &str, func: &str, set: Option<&str>) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
+    async fn query_on_node(
+        &self,
+        addr: &str,
+        id: &str,
+        func: &str,
+        set: Option<&str>,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
         let breaker = self.circuit_breaker.get_breaker(addr);
 
         // Try to connect and query
@@ -470,31 +463,44 @@ impl TarsRegistry {
     }
 
     /// Internal query implementation on a specific node
-    async fn do_query_internal(&self, addr: &str, id: &str, func: &str, set: Option<&str>) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
-        let client = self.connect_to_node(addr).await?;
+    async fn do_query_internal(
+        &self,
+        addr: &str,
+        id: &str,
+        func: &str,
+        set: Option<&str>,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
+        let mut stream = TcpStream::connect(addr).await?;
 
         // Build request body
         let mut body_buf = Buffer::new();
-        body_buf.write_string(id, 1)?;  // id at tag 1
+        body_buf.write_string(id, 1)?; // id at tag 1
 
         if let Some(set_id) = set {
-            body_buf.write_string(set_id, 2)?;  // setId at tag 2
+            body_buf.write_string(set_id, 2)?; // setId at tag 2
         }
 
         // Build request packet
         let mut req = RequestPacket::new();
-        req.s_servant_name = "tars.tarsregistry.QueryObj".to_string();
+        req.s_servant_name = self
+            .locator
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         req.s_func_name = func.to_string();
         req.s_buffer = body_buf.to_bytes();
         req.i_timeout = self.timeout;
 
-        // Invoke with timeout
-        let timeout_duration = std::time::Duration::from_millis(self.timeout as u64);
-        let rsp = match tokio::time::timeout(timeout_duration, client.invoke(&req)).await {
-            Ok(Ok(rsp)) => rsp,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(TarsError::Timeout(self.timeout as u64)),
-        };
+        stream.write_all(&req.encode()?).await?;
+        let size = stream.read_u32().await? as usize;
+        if !(4..=100 * 1024 * 1024).contains(&size) {
+            return Err(TarsError::Protocol("invalid registry frame size".into()));
+        }
+        let mut packet = vec![0; size];
+        packet[..4].copy_from_slice(&(size as u32).to_be_bytes());
+        stream.read_exact(&mut packet[4..]).await?;
+        let rsp = ResponsePacket::decode(&packet)?;
 
         if rsp.i_ret != 0 {
             return Err(TarsError::ServerError {
@@ -507,85 +513,101 @@ impl TarsRegistry {
         let mut reader = Reader::new(&rsp.s_buffer);
 
         // Return value at tag 0
-        let _ret = reader.read_int32(0, true)?;
+        let ret = reader.read_int32(0, true)?;
+        if ret != 0 {
+            return Err(TarsError::ServerError {
+                code: ret,
+                message: format!("{func}: {id}"),
+            });
+        }
+        let active_tag = if set.is_some() { 3 } else { 2 };
 
         // Active endpoints at tag 2
-        let active_epf = decode_endpoint_list(&mut reader, 2, true)?;
+        let active_epf = decode_endpoint_list(&mut reader, active_tag, true)?;
 
         // Inactive endpoints at tag 3
-        let inactive_epf = decode_endpoint_list(&mut reader, 3, false)?;
+        let inactive_epf = decode_endpoint_list(&mut reader, active_tag + 1, false)?;
 
         let active: Vec<Endpoint> = active_epf.iter().map(Self::convert_endpoint).collect();
         let inactive: Vec<Endpoint> = inactive_epf.iter().map(Self::convert_endpoint).collect();
 
-        debug!("Query {} on node {} returned {} active, {} inactive endpoints",
-               id, addr, active.len(), inactive.len());
+        debug!(
+            "Query {} on node {} returned {} active, {} inactive endpoints",
+            id,
+            addr,
+            active.len(),
+            inactive.len()
+        );
 
         Ok((active, inactive))
     }
 
     /// Query endpoints with automatic failover
-    async fn do_query(&self, id: &str, func: &str, set: Option<&str>) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
-        // Try each available node until one succeeds
-        let mut last_error: Option<TarsError> = None;
-        let mut tried_nodes = Vec::new();
-
-        // Try up to nodes.len() times to handle all nodes
-        for _ in 0..self.nodes.len() {
-            let node = match self.select_node() {
-                Some(n) => n,
-                None => {
-                    return Err(TarsError::NoEndpoint);
-                }
-            };
-
-            // Skip if already tried this node
-            if tried_nodes.contains(&node) {
-                continue;
-            }
-            tried_nodes.push(node.clone());
-
-            debug!("Trying registry node: {}", node);
-
-            match self.query_on_node(&node, id, func, set).await {
-                Ok(result) => {
-                    return Ok(result);
-                }
-                Err(e) => {
-                    warn!("Registry query failed on node {}: {}, trying next...", node, e);
-                    last_error = Some(e);
-                    // Continue to next node
-                }
-            }
+    async fn do_query(
+        &self,
+        id: &str,
+        func: &str,
+        set: Option<&str>,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
+        let mut candidates = self.circuit_breaker.filter_available(&self.nodes);
+        if candidates.is_empty() {
+            candidates = self.nodes.clone();
         }
-
-        // All nodes failed
-        error!("All registry nodes failed for query: {}", id);
-        Err(last_error.unwrap_or(TarsError::NoEndpoint))
+        if candidates.is_empty() {
+            return Err(TarsError::NoEndpoint);
+        }
+        let start = self.current_index.fetch_add(1, Ordering::SeqCst) % candidates.len();
+        candidates.rotate_left(start);
+        let timeout_ms = self.timeout.max(1) as u64;
+        let query = async {
+            let mut last_error = TarsError::NoEndpoint;
+            for node in candidates {
+                // Share the total deadline fairly so one stalled registry cannot starve failover.
+                let per_node = std::time::Duration::from_millis(
+                    (timeout_ms / self.nodes.len().max(1) as u64).max(1),
+                );
+                match tokio::time::timeout(per_node, self.query_on_node(&node, id, func, set)).await
+                {
+                    Ok(Ok(result)) => return Ok(result),
+                    Ok(Err(error)) => last_error = error,
+                    Err(_) => {
+                        self.circuit_breaker.get_breaker(&node).record_failure();
+                        last_error = TarsError::Timeout(timeout_ms);
+                    }
+                }
+            }
+            Err(last_error)
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), query)
+            .await
+            .map_err(|_| TarsError::Timeout(timeout_ms))?
     }
 }
 
 #[async_trait]
 impl Registrar for TarsRegistry {
     async fn register(&self, _servant: &ServantInstance) -> Result<()> {
-        // Registration is typically handled by tarsnode
-        // This is a placeholder for future implementation
-        warn!("TarsRegistry::register is not yet implemented");
+        // Native Tars registration is configured by the platform and maintained by tarsnode.
         Ok(())
     }
 
     async fn deregister(&self, _servant: &ServantInstance) -> Result<()> {
-        // Deregistration is typically handled by tarsnode
-        warn!("TarsRegistry::deregister is not yet implemented");
+        // As in TarsGo, native deregistration is handled by the platform.
         Ok(())
     }
 
     async fn query_servant(&self, id: &str) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
-        self.do_query(id, QUERY_FIND_OBJECT_BY_ID_4_ALL, None).await
+        self.do_query(id, QUERY_FIND_OBJECT_BY_ID_IN_SAME_GROUP, None)
+            .await
     }
 
-    async fn query_servant_by_set(&self, id: &str, set: &str) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
-        self.do_query(id, QUERY_FIND_OBJECT_BY_ID_IN_SAME_SET, Some(set)).await
+    async fn query_servant_by_set(
+        &self,
+        id: &str,
+        set: &str,
+    ) -> Result<(Vec<Endpoint>, Vec<Endpoint>)> {
+        self.do_query(id, QUERY_FIND_OBJECT_BY_ID_IN_SAME_SET, Some(set))
+            .await
     }
 }
 
@@ -596,6 +618,7 @@ pub struct EndpointManager {
     active_endpoints: RwLock<Vec<Endpoint>>,
     inactive_endpoints: RwLock<Vec<Endpoint>>,
     refresh_interval_ms: u64,
+    set_division: Option<String>,
 }
 
 impl EndpointManager {
@@ -605,7 +628,8 @@ impl EndpointManager {
             registrar,
             active_endpoints: RwLock::new(vec![]),
             inactive_endpoints: RwLock::new(vec![]),
-            refresh_interval_ms: 60_000,  // 60 seconds default
+            refresh_interval_ms: 60_000, // 60 seconds default
+            set_division: None,
         }
     }
 
@@ -614,9 +638,24 @@ impl EndpointManager {
         self
     }
 
+    pub fn with_set_division(mut self, set_division: Option<String>) -> Self {
+        self.set_division = set_division;
+        self
+    }
+
     /// Refresh endpoints from registry
     pub async fn refresh(&self) -> Result<()> {
-        let (active, inactive) = self.registrar.query_servant(&self.obj_name).await?;
+        let (active, inactive) = match &self.set_division {
+            Some(set) => {
+                self.registrar
+                    .query_servant_by_set(&self.obj_name, set)
+                    .await?
+            }
+            None => self.registrar.query_servant(&self.obj_name).await?,
+        };
+        if active.is_empty() {
+            return Err(TarsError::NoEndpoint);
+        }
 
         {
             let mut guard = self.active_endpoints.write().await;
@@ -643,14 +682,21 @@ impl EndpointManager {
     /// Start background refresh task
     pub fn start_refresh_task(self: Arc<Self>) {
         let interval = std::time::Duration::from_millis(self.refresh_interval_ms);
-        let manager = self.clone();
+        let manager = Arc::downgrade(&self);
 
         tokio::spawn(async move {
-            let mut interval_timer = tokio::time::interval(interval);
+            let mut interval_timer =
+                tokio::time::interval(interval.max(std::time::Duration::from_millis(1)));
             loop {
                 interval_timer.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
                 if let Err(e) = manager.refresh().await {
-                    error!("Failed to refresh endpoints for {}: {}", manager.obj_name, e);
+                    error!(
+                        "Failed to refresh endpoints for {}: {}",
+                        manager.obj_name, e
+                    );
                 }
             }
         });
@@ -684,7 +730,7 @@ mod tests {
     #[test]
     fn test_parse_multiple_nodes() {
         let registry = TarsRegistry::new(
-            "tars.tarsregistry.QueryObj@tcp -h 192.168.1.1 -p 17890:tcp -h 192.168.1.2 -p 17891"
+            "tars.tarsregistry.QueryObj@tcp -h 192.168.1.1 -p 17890:tcp -h 192.168.1.2 -p 17891",
         );
         assert_eq!(registry.nodes().len(), 2);
         assert!(registry.nodes().contains(&"192.168.1.1:17890".to_string()));

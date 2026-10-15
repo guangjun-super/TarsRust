@@ -26,3 +26,6 @@ signal-hook.workspace = true
 signal-hook-tokio.workspace = true
 md-5.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

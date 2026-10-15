@@ -417,3 +417,239 @@ async fn cancelling_run_stops_node_heartbeats() {
     node.abort();
     assert_eq!(app.server_config().app, "Test"); // caller still owns the Application
 }
+
+struct RecordingRegistry {
+    events: mpsc::UnboundedSender<(bool, tars_protocol::endpoint::ServantInstance)>,
+}
+#[async_trait::async_trait]
+impl tars_registry::registry::Registrar for RecordingRegistry {
+    async fn register(
+        &self,
+        instance: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        // Listener must already accept and serve when registration starts.
+        let mut stream = TcpStream::connect(instance.endpoint.address())
+            .await
+            .unwrap();
+        assert!(call(&mut stream, "echo", vec![42]).await.is_success());
+        self.events.send((true, instance.clone())).unwrap();
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+    async fn deregister(
+        &self,
+        instance: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        let mut stream = TcpStream::connect(instance.endpoint.address())
+            .await
+            .unwrap();
+        assert!(call(&mut stream, "echo", vec![42]).await.is_success());
+        self.events.send((false, instance.clone())).unwrap();
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+    async fn query_servant(
+        &self,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+    async fn query_servant_by_set(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+}
+#[tokio::test]
+async fn custom_registration_ready_before_register_and_deregister_before_close() {
+    for direct_shutdown in [false, true] {
+        let app = Arc::new(Application::new());
+        app.set_server_config(ServerConfig {
+            app: "App".into(),
+            server: "Server".into(),
+            enable_set: true,
+            set_division: "sz.area.1".into(),
+            ..Default::default()
+        });
+        app.add_servant("App.Server.Obj", Echo, "127.0.0.1:0")
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.set_registrar(Arc::new(RecordingRegistry { events: tx }));
+        let runner = app.clone();
+        let task = tokio::spawn(async move { runner.run().await });
+        let (register, instance) = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(register);
+        assert_ne!(instance.endpoint.port, 0);
+        assert_eq!(instance.servant, "App.Server.Obj");
+        assert_eq!(instance.object_name(), "App.Server.Obj");
+        assert!(instance.enable_set);
+        assert_eq!(instance.set_division, "sz.area.1");
+        if direct_shutdown {
+            app.shutdown().await.unwrap();
+        } else {
+            app.signal_shutdown();
+        }
+        task.await.unwrap().unwrap();
+        let (register, removed) = rx.recv().await.unwrap();
+        assert!(!register);
+        assert_eq!(removed.endpoint, instance.endpoint);
+        assert!(rx.try_recv().is_err());
+        assert!(TcpStream::connect(instance.endpoint.address())
+            .await
+            .is_err());
+        app.shutdown().await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+struct HangingRegistry {
+    events: mpsc::UnboundedSender<(bool, String)>,
+}
+#[async_trait::async_trait]
+impl tars_registry::registry::Registrar for HangingRegistry {
+    async fn register(
+        &self,
+        i: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        self.events.send((true, i.servant.clone())).unwrap();
+        std::future::pending().await
+    }
+    async fn deregister(
+        &self,
+        i: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        self.events.send((false, i.servant.clone())).unwrap();
+        std::future::pending().await
+    }
+    async fn query_servant(
+        &self,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+    async fn query_servant_by_set(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_registration_bounds_each_callback_and_excludes_admin() {
+    for direct in [false, true] {
+        let local_port = free_port().await;
+        let app = Arc::new(Application::new());
+        app.set_server_config(ServerConfig {
+            app: "App".into(),
+            server: "Server".into(),
+            local: format!("tcp -h 127.0.0.1 -p {local_port}"),
+            ..Default::default()
+        });
+        app.add_servant("App.Server.A", Echo, "127.0.0.1:0")
+            .unwrap();
+        app.add_servant("App.Server.B", Echo, "127.0.0.1:0")
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.set_registrar(Arc::new(HangingRegistry { events: tx }));
+        let a = app.clone();
+        let run = tokio::spawn(async move { a.run().await });
+        let first = rx.recv().await.unwrap();
+        assert!(first.0);
+        let close = if direct {
+            let a = app.clone();
+            Some(tokio::spawn(async move { a.shutdown().await }))
+        } else {
+            app.signal_shutdown();
+            None
+        };
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let second = rx.recv().await.unwrap();
+        assert!(second.0);
+        assert_ne!(first.1, second.1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let third = rx.recv().await.unwrap();
+        assert!(!third.0);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let fourth = rx.recv().await.unwrap();
+        assert!(!fourth.0);
+        let registered: HashSet<_> = [first.1, second.1].into_iter().collect();
+        let removed: HashSet<_> = [third.1, fourth.1].into_iter().collect();
+        assert_eq!(registered, removed);
+        assert!(!registered.contains("AdminObj"));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        run.await.unwrap().unwrap();
+        if let Some(close) = close {
+            close.await.unwrap().unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+struct BlockingDeregister {
+    entered: mpsc::UnboundedSender<tars_protocol::Endpoint>,
+    release: Arc<Semaphore>,
+}
+#[async_trait::async_trait]
+impl tars_registry::registry::Registrar for BlockingDeregister {
+    async fn register(
+        &self,
+        _: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        Ok(())
+    }
+    async fn deregister(
+        &self,
+        i: &tars_protocol::endpoint::ServantInstance,
+    ) -> tars_core::Result<()> {
+        self.entered.send(i.endpoint.clone()).unwrap();
+        let _p = self.release.acquire().await.unwrap();
+        Ok(())
+    }
+    async fn query_servant(
+        &self,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+    async fn query_servant_by_set(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> tars_core::Result<(Vec<tars_protocol::Endpoint>, Vec<tars_protocol::Endpoint>)> {
+        Err(tars_core::TarsError::NoEndpoint)
+    }
+}
+#[tokio::test]
+async fn cancelling_shutdown_does_not_cancel_cleanup() {
+    let app = Arc::new(Application::new());
+    app.add_servant("App.Server.Obj", Echo, "127.0.0.1:0")
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    app.set_registrar(Arc::new(BlockingDeregister {
+        entered: tx,
+        release: release.clone(),
+    }));
+    let a = app.clone();
+    let run = tokio::spawn(async move { a.run().await });
+    while app.state() != AppState::Running {
+        tokio::task::yield_now().await;
+    }
+    let a = app.clone();
+    let shutdown = tokio::spawn(async move { a.shutdown().await });
+    let endpoint = rx.recv().await.unwrap();
+    shutdown.abort();
+    let _ = shutdown.await;
+    release.add_permits(1);
+    timeout(Duration::from_secs(1), run)
+        .await
+        .expect("cleanup must survive caller cancellation")
+        .unwrap()
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+    assert!(TcpStream::connect(endpoint.address()).await.is_err());
+}

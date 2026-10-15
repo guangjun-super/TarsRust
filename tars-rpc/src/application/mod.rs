@@ -12,7 +12,8 @@ use tracing::info;
 
 use crate::communicator::Communicator;
 use tars_core::{Result, TarsError};
-use tars_protocol::Endpoint;
+use tars_protocol::{endpoint::ServantInstance, Endpoint};
+use tars_registry::registry::Registrar;
 use tars_transport::filter::Filters;
 use tars_transport::transport::{ServerProtocolHandler, TarsServer, TarsServerConfig};
 use tars_util::{ClientConfig, ServerConfig, TarsConfig};
@@ -33,6 +34,8 @@ pub enum AppState {
     Stopped,
 }
 
+type Registration = Option<(Arc<dyn Registrar>, Vec<ServantInstance>)>;
+
 /// Application is the main entry point for Tars services
 pub struct Application {
     /// Server configuration
@@ -42,13 +45,16 @@ pub struct Application {
     /// Communicator
     communicator: Arc<Communicator>,
     /// Registered servers
-    servers: RwLock<HashMap<String, Arc<TarsServer>>>,
+    servers: Arc<RwLock<HashMap<String, Arc<TarsServer>>>>,
     /// Object run list
     obj_run_list: RwLock<Vec<String>>,
     /// All filters
     filters: RwLock<Filters>,
     /// Application state
-    state: RwLock<AppState>,
+    state: Arc<RwLock<AppState>>,
+    registrar: RwLock<Option<Arc<dyn Registrar>>>,
+    registration: Arc<tokio::sync::Mutex<Registration>>,
+    shutdown_task: parking_lot::Mutex<Option<watch::Receiver<bool>>>,
     /// Shutdown sender
     shutdown_tx: watch::Sender<bool>,
 }
@@ -68,11 +74,14 @@ impl Application {
             server_config: RwLock::new(ServerConfig::default()),
             client_config: RwLock::new(ClientConfig::default()),
             communicator: Arc::new(Communicator::new()),
-            servers: RwLock::new(HashMap::new()),
+            servers: Arc::new(RwLock::new(HashMap::new())),
             obj_run_list: RwLock::new(Vec::new()),
             filters: RwLock::new(Filters::new()),
-            state: RwLock::new(AppState::Init),
+            state: Arc::new(RwLock::new(AppState::Init)),
             shutdown_tx,
+            registrar: RwLock::new(None),
+            registration: Arc::new(tokio::sync::Mutex::new(None)),
+            shutdown_task: parking_lot::Mutex::new(None),
         }
     }
 
@@ -131,7 +140,12 @@ impl Application {
 
     /// Set server configuration
     pub fn set_server_config(&self, config: ServerConfig) {
+        self.communicator
+            .set_property("enableset", if config.enable_set { "Y" } else { "N" });
+        self.communicator
+            .set_property("setdivision", &config.set_division);
         *self.server_config.write() = config;
+        self.configure_client();
     }
 
     /// Get client configuration
@@ -142,6 +156,50 @@ impl Application {
     /// Set client configuration
     pub fn set_client_config(&self, config: ClientConfig) {
         *self.client_config.write() = config;
+        self.configure_client();
+    }
+
+    fn configure_client(&self) {
+        let mut client = self.client_config();
+        let server = self.server_config();
+        if client.endpoint_cache_path.is_none() && !server.data_path.is_empty() {
+            client.endpoint_cache_path = Some(
+                std::path::Path::new(&server.data_path)
+                    .join(format!("{}.tarsdat", server.server))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        self.communicator.set_config(client);
+    }
+
+    /// Use a custom registrar for business registration and client discovery.
+    pub fn set_registrar(&self, registrar: Arc<dyn Registrar>) {
+        self.communicator.set_registrar(registrar.clone());
+        *self.registrar.write() = Some(registrar);
+    }
+
+    async fn registry_callback(
+        registrar: &dyn Registrar,
+        instance: &ServantInstance,
+        register: bool,
+    ) {
+        let callback = async {
+            if register {
+                registrar.register(instance).await
+            } else {
+                registrar.deregister(instance).await
+            }
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), callback).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(servant = %instance.servant, register, "registrar callback failed: {error}")
+            }
+            Err(_) => {
+                tracing::warn!(servant = %instance.servant, register, "registrar callback timed out")
+            }
+        }
     }
 
     /// Get communicator
@@ -217,6 +275,7 @@ impl Application {
 
     /// Run the application
     pub async fn run(&self) -> Result<()> {
+        let mut registration = self.registration.lock().await;
         if self.state() != AppState::Init {
             return Err(TarsError::Config("application can only run once".into()));
         }
@@ -248,8 +307,30 @@ impl Application {
         };
         // Bind every socket before reporting readiness. A failure drops all listeners.
         let mut listeners = Vec::new();
+        let mut instances = Vec::new();
         for (name, server) in &servers {
             let listener = server.bind().await?;
+            if name != "AdminObj" || config.local.is_empty() {
+                let address = listener.local_addr()?;
+                let adapter = config
+                    .adapters
+                    .values()
+                    .find(|adapter| &adapter.servant == name);
+                let mut endpoint = adapter
+                    .and_then(|a| tars_protocol::endpoint::parse_endpoint_string(&a.endpoint))
+                    .unwrap_or_else(|| Endpoint::tcp(address.ip().to_string(), address.port()));
+                endpoint.port = address.port();
+                instances.push(ServantInstance {
+                    tars_version: env!("CARGO_PKG_VERSION").into(),
+                    app: config.app.clone(),
+                    server: config.server.clone(),
+                    enable_set: config.enable_set,
+                    set_division: config.set_division.clone(),
+                    servant: name.clone(),
+                    protocol: adapter.map_or("tars", |a| a.protocol.as_str()).into(),
+                    endpoint,
+                });
+            }
             info!("Starting server: {name}");
             listeners.push((server.clone(), listener));
         }
@@ -262,6 +343,14 @@ impl Application {
         if let Some(node) = node {
             reporters.spawn(node.run(self.shutdown_tx.subscribe()));
         }
+        let registrar = self.registrar.read().clone();
+        if let Some(registrar) = registrar {
+            *registration = Some((registrar.clone(), instances.clone()));
+            for instance in &instances {
+                Self::registry_callback(registrar.as_ref(), instance, true).await;
+            }
+        }
+        drop(registration);
         let mut result = Ok(());
         tokio::select! {
             _ = self.wait_for_shutdown() => {},
@@ -313,19 +402,43 @@ impl Application {
 
     /// Shutdown the application gracefully
     pub async fn shutdown(&self) -> Result<()> {
-        *self.state.write() = AppState::ShuttingDown;
+        // Own cleanup independently of any individual caller's future.
         self.shutdown_tx.send_replace(true);
-        info!("Shutting down application...");
-
-        // Shutdown all servers
-        let servers = self.servers.read().clone();
-        let mut shutdowns = JoinSet::new();
-        for (name, server) in servers {
-            info!("Shutting down server: {}", name);
-            shutdowns.spawn(async move { server.shutdown().await });
+        let mut completion = {
+            let mut task = self.shutdown_task.lock();
+            task.get_or_insert_with(|| {
+                let (done, completion) = watch::channel(false);
+                let registration = self.registration.clone();
+                let servers = self.servers.clone();
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    let mut registration = registration.lock().await;
+                    *state.write() = AppState::ShuttingDown;
+                    if let Some((registrar, instances)) = registration.take() {
+                        for instance in &instances {
+                            Self::registry_callback(registrar.as_ref(), instance, false).await;
+                        }
+                    }
+                    drop(registration);
+                    let servers = servers.read().clone();
+                    let mut shutdowns = JoinSet::new();
+                    for (_, server) in servers {
+                        shutdowns.spawn(async move { server.shutdown().await });
+                    }
+                    while shutdowns.join_next().await.is_some() {}
+                    *state.write() = AppState::Stopped;
+                    done.send_replace(true);
+                });
+                completion
+            })
+            .clone()
+        };
+        while !*completion.borrow_and_update() {
+            completion
+                .changed()
+                .await
+                .map_err(|_| TarsError::Protocol("shutdown task stopped unexpectedly".into()))?;
         }
-        while shutdowns.join_next().await.is_some() {}
-
         Ok(())
     }
 

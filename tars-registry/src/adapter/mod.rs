@@ -2,9 +2,9 @@
 //!
 //! AdapterProxy manages a connection to a single service endpoint.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::debug;
 
@@ -16,10 +16,12 @@ use tars_transport::transport::{ClientProtocol, TarsClient, TarsClientConfig};
 
 /// AdapterProxy manages connection to a single endpoint
 pub struct AdapterProxy {
+    clock: tokio::time::Instant,
     /// Endpoint information
     endpoint: Endpoint,
     /// Transport client
-    client: Arc<TarsClient>,
+    client: parking_lot::RwLock<Arc<TarsClient>>,
+    client_config: TarsClientConfig,
     /// Protocol handler
     protocol: Arc<TarsProtocol>,
     /// Response channels: request_id -> response sender (shared with AdapterProtocolHandler)
@@ -54,21 +56,23 @@ impl AdapterProxy {
         let responses = Arc::new(DashMap::new());
 
         let adapter = Arc::new(Self {
+            clock: tokio::time::Instant::now(),
             endpoint,
-            client: TarsClient::new(
+            client_config: config.clone(),
+            client: parking_lot::RwLock::new(TarsClient::new(
                 &address,
                 Arc::new(AdapterProtocolHandler::new(Arc::clone(&responses))),
                 config,
-            ),
+            )),
             protocol,
             responses,
             fail_count: AtomicI32::new(0),
             last_fail_count: AtomicI32::new(0),
             send_count: AtomicI32::new(0),
             success_count: AtomicI32::new(0),
-            last_success_time: AtomicI64::new(now_secs()),
-            last_block_time: AtomicI64::new(now_secs()),
-            last_check_time: AtomicI64::new(now_secs()),
+            last_success_time: AtomicI64::new(0),
+            last_block_time: AtomicI64::new(0),
+            last_check_time: AtomicI64::new(0),
             status: AtomicBool::new(true),
             closed: AtomicBool::new(false),
             push_callback: None,
@@ -97,7 +101,21 @@ impl AdapterProxy {
         self.send_count.fetch_add(1, Ordering::SeqCst);
 
         let data = self.protocol.request_pack(req)?;
-        self.client.send(data).await?;
+        if self.is_closed() {
+            return Err(tars_core::TarsError::ConnectionClosed);
+        }
+        let client = {
+            let mut client = self.client.write();
+            if client.is_closed() {
+                *client = TarsClient::new(
+                    &self.endpoint.address(),
+                    Arc::new(AdapterProtocolHandler::new(self.responses.clone())),
+                    self.client_config.clone(),
+                );
+            }
+            client.clone()
+        };
+        client.send(data).await?;
 
         Ok(())
     }
@@ -144,7 +162,11 @@ impl AdapterProxy {
 
     /// Record success
     pub fn success_add(&self) {
-        self.last_success_time.store(now_secs(), Ordering::SeqCst);
+        if !self.is_active() {
+            self.reset();
+        }
+        self.last_success_time
+            .store(self.clock.elapsed().as_secs() as i64, Ordering::SeqCst);
         self.success_count.fetch_add(1, Ordering::SeqCst);
         self.last_fail_count.store(0, Ordering::SeqCst);
     }
@@ -162,7 +184,7 @@ impl AdapterProxy {
             return (false, false);
         }
 
-        let now = now_secs();
+        let now = self.clock.elapsed().as_secs() as i64;
 
         if self.status.load(Ordering::SeqCst) {
             // Active status
@@ -212,7 +234,7 @@ impl AdapterProxy {
 
     /// Reset statistics
     pub fn reset(&self) {
-        let now = now_secs();
+        let now = self.clock.elapsed().as_secs() as i64;
         self.send_count.store(0, Ordering::SeqCst);
         self.success_count.store(0, Ordering::SeqCst);
         self.fail_count.store(0, Ordering::SeqCst);
@@ -225,16 +247,9 @@ impl AdapterProxy {
     /// Close the adapter
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.client.close();
+        self.client.read().close();
+        self.responses.clear();
     }
-}
-
-/// Get current time in seconds
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
 }
 
 /// Protocol handler for adapter
@@ -296,5 +311,36 @@ mod tests {
 
         assert_eq!(adapter.success_count.load(Ordering::SeqCst), 2);
         assert_eq!(adapter.fail_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+    #[tokio::test]
+    async fn exhausted_transport_can_send_again_on_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adapter = AdapterProxy::new(
+            Endpoint::tcp("127.0.0.1", listener.local_addr().unwrap().port()),
+            TarsClientConfig::tcp(),
+        );
+        adapter.client.read().close();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read_u32().await.unwrap();
+            let mut packet = vec![0; size as usize];
+            packet[..4].copy_from_slice(&size.to_be_bytes());
+            stream.read_exact(&mut packet[4..]).await.unwrap();
+            assert_eq!(RequestPacket::decode(&packet).unwrap().s_func_name, "probe");
+        });
+        let mut request = RequestPacket::new();
+        request.s_func_name = "probe".into();
+        adapter.send(&request).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        adapter.close();
     }
 }

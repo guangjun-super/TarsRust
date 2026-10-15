@@ -101,3 +101,17 @@
 ## Execution Recommendation
 
 Use native execution in this session: Tasks 2–5 share proxy/configuration lifecycle interfaces, so retaining one implementation context avoids repeated handoffs. Run a fresh whole-change review after integration. No temporary branch or worktree is required for these changes while the checkout remains clean apart from the approved documents.
+
+## Execution Results (2026-10-15)
+
+Tasks 1–5 implemented in the current session on `codex/service-discovery`.
+
+- `cargo test --workspace`: 146 passed, 0 failed, 3 previously ignored tests.
+- `cargo clippy --workspace --all-targets`: succeeded; existing warnings remain.
+- `rustfmt --check --edition 2021` on all changed/new Rust files: passed.
+- `cargo fmt --all -- --check`: existing formatting differences in 32 untouched files; baseline 8cdba27 also fails (39 files). No new formatting failures.
+- Go fixture generation: `GOCACHE=/tmp/tarsrust-go-cache GOPROXY=off GOWORK=off go run <repo>/tars-registry/tests/fixtures/queryf.go` from a temporary module replacing TarsGo with the local checkout; succeeded. Both generated response bodies are consumed by QueryF integration tests.
+- Independent review found shutdown cancellation and delayed transport closure. Both were reproduced by failing tests and fixed; pending response release during removal was additionally covered and corrected.
+- No live Tars platform was available; real platform publishing/restarting is not claimed as verified.
+
+Implementation decisions: isolate on a feature branch in the current checkout; keep disk cache identity object/Locator/SET (stable across restarts, matching Go); use a monotonic health clock and independently owned shutdown operation. Cache records use Rust-specific versioned TOML as specified. Removing an endpoint can terminate its in-flight RPCs with ConnectionClosed, after which callers can retry against refreshed nodes.

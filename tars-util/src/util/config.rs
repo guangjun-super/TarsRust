@@ -1,8 +1,8 @@
 //! Configuration structures
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,17 +71,39 @@ pub struct ServerConfig {
     pub adapters: HashMap<String, AdapterConfig>,
 }
 
-fn default_accept_timeout() -> u64 { 10000 }
-fn default_main_loop_interval() -> u64 { 10000 }
-fn default_read_timeout() -> u64 { 60000 }
-fn default_write_timeout() -> u64 { 60000 }
-fn default_handle_timeout() -> u64 { 60000 }
-fn default_idle_timeout() -> u64 { 600000 }
-fn default_max_invoke() -> i32 { 200000 }
-fn default_queue_cap() -> usize { 10000 }
-fn default_tcp_read_buffer() -> usize { 128 * 1024 }
-fn default_tcp_write_buffer() -> usize { 128 * 1024 }
-fn default_tcp_no_delay() -> bool { false }
+fn default_accept_timeout() -> u64 {
+    10000
+}
+fn default_main_loop_interval() -> u64 {
+    10000
+}
+fn default_read_timeout() -> u64 {
+    60000
+}
+fn default_write_timeout() -> u64 {
+    60000
+}
+fn default_handle_timeout() -> u64 {
+    60000
+}
+fn default_idle_timeout() -> u64 {
+    600000
+}
+fn default_max_invoke() -> i32 {
+    200000
+}
+fn default_queue_cap() -> usize {
+    10000
+}
+fn default_tcp_read_buffer() -> usize {
+    128 * 1024
+}
+fn default_tcp_write_buffer() -> usize {
+    128 * 1024
+}
+fn default_tcp_no_delay() -> bool {
+    false
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -189,6 +211,12 @@ pub struct ClientConfig {
     /// Refresh endpoint interval (ms)
     #[serde(default = "default_refresh_interval")]
     pub refresh_endpoint_interval: u64,
+    /// Optional Rust discovery cache file.
+    #[serde(default)]
+    pub endpoint_cache_path: Option<String>,
+    /// Health check interval (ms).
+    #[serde(default = "default_report_interval")]
+    pub check_status_interval: u64,
     /// Report interval (ms)
     #[serde(default = "default_report_interval")]
     pub report_interval: u64,
@@ -221,18 +249,42 @@ pub struct ClientConfig {
     pub keep_alive_interval: u64,
 }
 
-fn default_async_timeout() -> u64 { 3000 }
-fn default_refresh_interval() -> u64 { 60000 }
-fn default_report_interval() -> u64 { 10000 }
-fn default_sample_rate() -> u32 { 1000 }
-fn default_max_sample_count() -> u32 { 100 }
-fn default_dial_timeout() -> u64 { 3000 }
-fn default_client_idle_timeout() -> u64 { 600000 }
-fn default_client_read_timeout() -> u64 { 3000 }
-fn default_client_write_timeout() -> u64 { 3000 }
-fn default_client_queue_len() -> usize { 10000 }
-fn default_obj_queue_max() -> i32 { 10000 }
-fn default_keep_alive_interval() -> u64 { 60000 }
+fn default_async_timeout() -> u64 {
+    3000
+}
+fn default_refresh_interval() -> u64 {
+    60000
+}
+fn default_report_interval() -> u64 {
+    10000
+}
+fn default_sample_rate() -> u32 {
+    1000
+}
+fn default_max_sample_count() -> u32 {
+    100
+}
+fn default_dial_timeout() -> u64 {
+    3000
+}
+fn default_client_idle_timeout() -> u64 {
+    600000
+}
+fn default_client_read_timeout() -> u64 {
+    3000
+}
+fn default_client_write_timeout() -> u64 {
+    3000
+}
+fn default_client_queue_len() -> usize {
+    10000
+}
+fn default_obj_queue_max() -> i32 {
+    10000
+}
+fn default_keep_alive_interval() -> u64 {
+    60000
+}
 
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -242,6 +294,8 @@ impl Default for ClientConfig {
             property: String::new(),
             async_invoke_timeout: default_async_timeout(),
             refresh_endpoint_interval: default_refresh_interval(),
+            endpoint_cache_path: None,
+            check_status_interval: 10000,
             report_interval: default_report_interval(),
             sample_rate: default_sample_rate(),
             max_sample_count: default_max_sample_count(),

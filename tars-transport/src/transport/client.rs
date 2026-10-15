@@ -1,19 +1,19 @@
 //! Tars client transport implementation
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use parking_lot::Mutex;
-use tracing::{debug, error, warn, info};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
+use tracing::{debug, error, info, warn};
 
+use super::tls::parse_server_name;
+use super::{ClientProtocol, TarsClientConfig};
 use tars_core::codec::PackageStatus;
 use tars_core::{Result, TarsError};
-use super::{TarsClientConfig, ClientProtocol};
-use super::tls::parse_server_name;
 
 /// Message to be sent
 struct SendMessage {
@@ -30,6 +30,7 @@ pub struct TarsClient {
     protocol: Arc<dyn ClientProtocol>,
     /// Send channel
     send_tx: mpsc::Sender<SendMessage>,
+    connection_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Close flag
     closed: AtomicBool,
     /// Number of pending requests
@@ -53,15 +54,17 @@ impl TarsClient {
             protocol,
             send_tx,
             closed: AtomicBool::new(false),
+            connection_task: Mutex::new(None),
             invoke_num: AtomicI32::new(0),
             last_activity: Mutex::new(Instant::now()),
         });
 
         // Start background connection task
         let client_clone = Arc::clone(&client);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             client_clone.connection_loop(send_rx).await;
         });
+        *client.connection_task.lock() = Some(task.abort_handle());
 
         client
     }
@@ -96,6 +99,9 @@ impl TarsClient {
     /// Close the client
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        if let Some(task) = self.connection_task.lock().take() {
+            task.abort();
+        }
     }
 
     /// Reconnect to the server
@@ -128,7 +134,8 @@ impl TarsClient {
                         error!("Max retries exceeded, closing connection");
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * retry_count as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * retry_count as u64))
+                        .await;
                 }
             }
         }
@@ -139,13 +146,11 @@ impl TarsClient {
     /// Connect and handle communication
     async fn connect_and_handle(&self, send_rx: &mut mpsc::Receiver<SendMessage>) -> Result<()> {
         // Connect with timeout
-        let tcp_stream = tokio::time::timeout(
-            self.config.dial_timeout,
-            TcpStream::connect(&self.address),
-        )
-        .await
-        .map_err(|_| TarsError::Timeout(self.config.dial_timeout.as_millis() as u64))?
-        .map_err(TarsError::Transport)?;
+        let tcp_stream =
+            tokio::time::timeout(self.config.dial_timeout, TcpStream::connect(&self.address))
+                .await
+                .map_err(|_| TarsError::Timeout(self.config.dial_timeout.as_millis() as u64))?
+                .map_err(TarsError::Transport)?;
 
         // Set TCP options
         tcp_stream.set_nodelay(true)?;
@@ -153,8 +158,10 @@ impl TarsClient {
         // Check if TLS is enabled
         if self.config.is_ssl() {
             // TLS connection
-            let tls_config = self.config.tls_config.as_ref()
-                .ok_or_else(|| TarsError::Config("TLS config not set for SSL connection".into()))?;
+            let tls_config =
+                self.config.tls_config.as_ref().ok_or_else(|| {
+                    TarsError::Config("TLS config not set for SSL connection".into())
+                })?;
 
             let server_name = parse_server_name(&self.address)?;
             let connector = TlsConnector::from(tls_config.clone());
@@ -195,7 +202,7 @@ impl TarsClient {
         let protocol = Arc::clone(&self.protocol);
         let read_timeout = self.config.read_timeout;
 
-        let read_handle = tokio::spawn(async move {
+        let mut read_handle = tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
             let mut accumulated = Vec::new();
 
@@ -237,6 +244,7 @@ impl TarsClient {
             Ok(())
         });
 
+        let _read_guard = AbortOnDrop(read_handle.abort_handle());
         // Write loop
         let write_timeout = self.config.write_timeout;
         loop {
@@ -245,10 +253,13 @@ impl TarsClient {
             }
 
             tokio::select! {
+                stopped = &mut read_handle => {
+                    return stopped.map_err(|error| TarsError::Protocol(format!("reader stopped: {error}")))?;
+                }
                 Some(msg) = send_rx.recv() => {
                     match tokio::time::timeout(write_timeout, write_half.write_all(&msg.data)).await {
                         Ok(Ok(_)) => {
-                            // Success
+                            self.invoke_num.fetch_sub(1, Ordering::SeqCst);
                         }
                         Ok(Err(e)) => {
                             error!("Write error: {}", e);
@@ -274,6 +285,14 @@ impl TarsClient {
         // Clean up
         read_handle.abort();
         Ok(())
+    }
+}
+
+// A connection cancellation/error must also release the spawned reader half.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

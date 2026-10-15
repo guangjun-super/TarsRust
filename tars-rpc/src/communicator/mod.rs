@@ -2,15 +2,18 @@
 //!
 //! Communicator is the client-side communication manager.
 
-use std::sync::Arc;
-use std::collections::HashMap;
-use parking_lot::RwLock;
-use once_cell::sync::OnceCell;
+pub(crate) mod cache;
 
-use crate::servant::ServantProxy;
+use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::servant::{discovery::Discovery, ServantProxy};
 use tars_core::{Result, TarsError};
 use tars_protocol::endpoint::parse_obj_name;
 use tars_protocol::Endpoint;
+use tars_registry::registry::{Registrar, TarsRegistry};
 use tars_transport::transport::TarsClientConfig;
 use tars_util::ClientConfig;
 
@@ -23,6 +26,7 @@ pub struct Communicator {
     config: RwLock<ClientConfig>,
     /// Servant proxies cache
     proxies: RwLock<HashMap<String, Arc<ServantProxy>>>,
+    registrar: RwLock<Option<Arc<dyn Registrar>>>,
     /// Properties
     properties: RwLock<HashMap<String, String>>,
 }
@@ -40,14 +44,26 @@ impl Communicator {
             config: RwLock::new(ClientConfig::default()),
             proxies: RwLock::new(HashMap::new()),
             properties: RwLock::new(HashMap::new()),
+            registrar: RwLock::new(None),
         }
     }
 
     /// Create with configuration
     pub fn with_config(config: ClientConfig) -> Self {
         let comm = Self::new();
-        *comm.config.write() = config;
+        comm.set_config(config);
         comm
+    }
+
+    pub fn set_config(&self, config: ClientConfig) {
+        self.set_property("locator", &config.locator);
+        *self.config.write() = config;
+    }
+
+    pub fn set_registrar(&self, registrar: Arc<dyn Registrar>) {
+        *self.registrar.write() = Some(registrar);
+        // Existing proxies retain their captured registrar; new ones must not reuse them.
+        self.proxies.write().clear();
     }
 
     /// Get the global communicator instance
@@ -75,7 +91,9 @@ impl Communicator {
 
     /// Set a property
     pub fn set_property(&self, key: &str, value: &str) {
-        self.properties.write().insert(key.to_string(), value.to_string());
+        self.properties
+            .write()
+            .insert(key.to_string(), value.to_string());
     }
 
     /// Get a property
@@ -99,27 +117,58 @@ impl Communicator {
             return Err(TarsError::InvalidArgument("empty object name".into()));
         }
 
-        // Check cache
-        {
-            let proxies = self.proxies.read();
-            if let Some(proxy) = proxies.get(obj_name) {
-                return Ok(Arc::clone(proxy));
-            }
-        }
-
-        // Parse object name
-        let (name, endpoints) = parse_obj_name(obj_name);
-
-        let endpoints = if endpoints.is_empty() {
-            // TODO: Query from registry
-            // For now, return error if no direct endpoints
-            return Err(TarsError::ServiceNotFound(name));
+        let config = self.config.read().clone();
+        let props = self.properties.read();
+        let enabled = props
+            .get("enableset")
+            .is_some_and(|v| v.eq_ignore_ascii_case("y") || v.eq_ignore_ascii_case("true"));
+        let set = if enabled {
+            Some(props.get("setdivision").cloned().unwrap_or_default())
         } else {
-            endpoints
+            None
+        };
+        drop(props);
+        let key = format!("{:?}", (obj_name, &config.locator, &set));
+        let mut proxies = self.proxies.write();
+        if let Some(proxy) = proxies.get(&key) {
+            return Ok(proxy.clone());
+        }
+        let (name, endpoints) = parse_obj_name(obj_name);
+        if name.is_empty() {
+            return Err(TarsError::InvalidArgument("empty object name".into()));
+        }
+        if obj_name.contains('@') && endpoints.is_empty() {
+            return Err(TarsError::Config("invalid direct endpoint".into()));
+        }
+        let discovery = if endpoints.is_empty() {
+            let registrar = match self.registrar.read().clone() {
+                Some(registrar) => registrar,
+                None if !config.locator.is_empty() => Arc::new(
+                    TarsRegistry::new(&config.locator)
+                        .with_timeout(config.async_invoke_timeout.min(i32::MAX as u64) as i32),
+                ),
+                None => {
+                    return Err(TarsError::Config(
+                        "object-name discovery requires a locator or registrar".into(),
+                    ))
+                }
+            };
+            Some(Arc::new(Discovery::new(
+                &name,
+                registrar,
+                set,
+                config.refresh_endpoint_interval,
+                config.async_invoke_timeout,
+                config
+                    .endpoint_cache_path
+                    .clone()
+                    .map(|path| cache::DiscoveryCache::new(path, key.clone())),
+            )))
+        } else {
+            None
         };
 
         // Create client config
-        let config = self.config.read();
         let client_config = TarsClientConfig::tcp()
             .with_queue_len(config.queue_len)
             .with_idle_timeout(config.idle_timeout_duration())
@@ -128,11 +177,17 @@ impl Communicator {
             .with_dial_timeout(config.dial_timeout_duration());
 
         // Create proxy
-        let proxy = Arc::new(ServantProxy::new(&name, endpoints, client_config));
+        let proxy = ServantProxy::managed(
+            &name,
+            endpoints,
+            client_config,
+            discovery,
+            config.check_status_interval,
+        );
         proxy.set_timeout(config.async_invoke_timeout);
 
         // Cache proxy
-        self.proxies.write().insert(obj_name.to_string(), Arc::clone(&proxy));
+        proxies.insert(key, Arc::clone(&proxy));
 
         Ok(proxy)
     }
@@ -145,15 +200,18 @@ impl Communicator {
     /// Refresh servant endpoints
     pub fn refresh_servant(&self, obj_name: &str, endpoints: Vec<Endpoint>) -> Result<()> {
         let proxies = self.proxies.read();
-        if let Some(proxy) = proxies.get(obj_name) {
-            proxy.refresh_endpoints(endpoints);
+        for proxy in proxies
+            .values()
+            .filter(|proxy| proxy.name() == parse_obj_name(obj_name).0)
+        {
+            proxy.refresh_endpoints(endpoints.clone());
         }
         Ok(())
     }
 
     /// Calculate hash key for this communicator (for endpoint manager)
     pub fn hash_key(&self) -> String {
-        use md5::{Md5, Digest};
+        use md5::{Digest, Md5};
 
         let mut hasher = Md5::new();
         let props = self.properties.read();
